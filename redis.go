@@ -21,17 +21,33 @@ func main() {
 		fmt.Scanln(&cmd, &key, &value)
 
 		if cmd == "GET" {
-			fmt.Printf("> %s\n\n", kvs.Get(key))
+
+			lookup_result, err := kvs.Get(key)
+
+			if err != nil {
+				fmt.Printf("> [miss] key '%s' does not exist\n\n", key)
+			} else {
+				fmt.Printf("> %s\n\n", lookup_result)
+			}
+
 		} else if cmd == "SET" {
+
 			kvs.Set(key, value)
 			fmt.Printf(">\n\n")
+
 		} else if cmd == "DEL" {
+
 			kvs.Delete(key)
 			fmt.Printf(">\n\n")
+
 		} else if strings.ToLower(cmd) == "exit" {
+
 			break
+
 		} else {
+
 			fmt.Printf("Unrecognized command, try again.\n\n")
+
 		}
 	}
 }

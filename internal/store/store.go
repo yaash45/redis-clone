@@ -1,5 +1,7 @@
 package store
 
+import "errors"
+
 // Represents an in-memory Key-Value store
 type KVStore struct {
 	store map[string]string
@@ -11,8 +13,14 @@ func NewStore() *KVStore {
 }
 
 // Get the value for a given key from the Key-Value Store.
-func (kvs *KVStore) Get(key string) string {
-	return kvs.store[key]
+func (kvs *KVStore) Get(key string) (string, error) {
+	val := kvs.store[key]
+
+	if val == "" {
+		return "", errors.New("Key not found.")
+	}
+
+	return kvs.store[key], nil
 }
 
 // Stores a Key-Value pair in the store, overriding

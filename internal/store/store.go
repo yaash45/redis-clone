@@ -25,7 +25,7 @@ func (kvs *KVStore) Get(key string) (string, error) {
 		return "", errors.New("Key not found.")
 	}
 
-	return kvs.store[key], nil
+	return val, nil
 }
 
 // Stores a Key-Value pair in the store, overriding

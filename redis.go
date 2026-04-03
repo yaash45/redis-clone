@@ -38,6 +38,9 @@ func main() {
 	// Keep track of the client connections and track write error counts
 	var clientsAndErrorCounts map[net.Conn]int = make(map[net.Conn]int)
 
+	// Keep track of a single read buffer for each connection
+	var clientReadBuffers map[net.Conn]*bufio.Reader = make(map[net.Conn]*bufio.Reader)
+
 	// Process commands until server is terminated
 	for {
 		// Accept new connections, but set a deadline before moving on
@@ -65,6 +68,7 @@ func main() {
 				// Client connection is already being tracked, nothing to do here
 			} else {
 				clientsAndErrorCounts[conn] = 0
+				clientReadBuffers[conn] = bufio.NewReader(conn)
 				// Acknowledge the connection to the client
 				_, err := conn.Write([]byte("Connected. Type commands or 'exit'.\n\n> "))
 
@@ -74,6 +78,7 @@ func main() {
 						log.Printf("max attepts to write to %s exhausted. closing connection", conn.RemoteAddr().String())
 						conn.Close()
 						delete(clientsAndErrorCounts, conn)
+						delete(clientReadBuffers, conn)
 					} else {
 						log.Println("server write error")
 						clientsAndErrorCounts[conn] += 1
@@ -86,8 +91,8 @@ func main() {
 		var code int
 
 		// Serve all clients one-by-one
-		for c := range clientsAndErrorCounts {
-			code = handleConnection(c, kvs)
+		for c, rbuf := range clientReadBuffers {
+			code = handleConnection(c, rbuf, kvs)
 
 			switch code {
 			case 0:
@@ -113,13 +118,12 @@ func main() {
 //   - 0 if there is nothing to read, and not close the connection
 //   - 1 benign exit, so just close the connection
 //   - -1 if there is an error
-func handleConnection(conn net.Conn, kvs *store.KVStore) int {
-	reader := bufio.NewReader(conn)
+func handleConnection(conn net.Conn, rbuf *bufio.Reader, kvs *store.KVStore) int {
 
 	// set a 500 millisecond read deadline
 	conn.SetReadDeadline(time.Now().Add(time.Millisecond * 10))
 
-	message, err := reader.ReadString('\n')
+	message, err := rbuf.ReadString('\n')
 
 	if err != nil {
 

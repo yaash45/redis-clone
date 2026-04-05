@@ -1,25 +1,29 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strings"
 	"time"
 
+	"github.com/yaash45/redis/internal/client"
 	"github.com/yaash45/redis/internal/command"
+	"github.com/yaash45/redis/internal/status"
 	"github.com/yaash45/redis/internal/store"
 )
 
 var PORT = ":6379"
+var TCP_ACCEPTANCE_DURATION = time.Millisecond * 50
 
 func main() {
 
 	// Initialize new in-memory key-value store
 	kvs := store.NewStore()
+
+	// Initialize a registry to track all the clients connected to the server
+	clientRegistry := client.NewRegistry()
 
 	// Set-up a tcp listener
 	listener, err := net.Listen("tcp", PORT)
@@ -35,17 +39,11 @@ func main() {
 
 	defer tcpListener.Close()
 
-	// Keep track of the client connections and track write error counts
-	var clientsAndErrorCounts map[net.Conn]int = make(map[net.Conn]int)
-
-	// Keep track of a single read buffer for each connection
-	var clientReadBuffers map[net.Conn]*bufio.Reader = make(map[net.Conn]*bufio.Reader)
-
 	// Process commands until server is terminated
 	for {
 		// Accept new connections, but set a deadline before moving on
 		// to check for any other clients trying to connect
-		tcpListener.SetDeadline(time.Now().Add(time.Millisecond * 10))
+		tcpListener.SetDeadline(time.Now().Add(TCP_ACCEPTANCE_DURATION))
 		conn, err := tcpListener.Accept()
 
 		if err != nil {
@@ -62,123 +60,124 @@ func main() {
 		// If a timeout happens, the connection is nil, so check before
 		// adding it to our list of tracked clients
 		if conn != nil {
-			val, ok := clientsAndErrorCounts[conn]
+			c := clientRegistry.Register(conn)
 
-			if ok {
-				// Client connection is already being tracked, nothing to do here
-			} else {
-				clientsAndErrorCounts[conn] = 0
-				clientReadBuffers[conn] = bufio.NewReader(conn)
-				// Acknowledge the connection to the client
-				_, err := conn.Write([]byte("Connected. Type commands or 'exit'.\n\n> "))
+			// Acknowledge the connection to the client
+			writeResult := c.Write([]byte("Connected. Type commands or 'exit'.\n\n> "))
 
-				if err != nil {
-					// Something went wrong
-					if val > 3 {
-						log.Printf("max attepts to write to %s exhausted. closing connection", conn.RemoteAddr().String())
-						conn.Close()
-						delete(clientsAndErrorCounts, conn)
-						delete(clientReadBuffers, conn)
-					} else {
-						log.Println("server write error")
-						clientsAndErrorCounts[conn] += 1
-					}
-					continue
-				}
+			if writeResult.Status() == status.FatalErr {
+				// Something went wrong, remove client
+				clientRegistry.Remove(c)
 			}
 		}
 
-		var code int
+		var clientsToRemove []*client.Client
 
 		// Serve all clients one-by-one
-		for c, rbuf := range clientReadBuffers {
-			code = handleConnection(c, rbuf, kvs)
+		for _, c := range clientRegistry.Clients {
+			code := handleConnection(c, kvs)
 
 			switch code {
-			case 0:
-				// Simple timeout, keep going
-			case 1:
+			case status.Success:
+				// Succesful operation, keep going
+				log.Printf("[success] remote: %s", c.RemoteAddr())
+
+			case status.Timeout:
+				// Timeout, keep serving other clients
+
+			case status.Close:
 				// Exit was issued, close connection normally
-				c.Write([]byte("Connection closed.\n"))
-				c.Close()
-				delete(clientsAndErrorCounts, c)
-			default:
-				// Some error occured
-				c.Write([]byte("Server error.\n"))
-				c.Close()
-				delete(clientsAndErrorCounts, c)
+				log.Printf("[close] remote: %s", c.RemoteAddr())
+
+				if res := c.Write([]byte("Connection closed.\n\n")); res.Status() != status.Success {
+					log.Println("write failed during close: ", res.Error())
+				}
+				clientsToRemove = append(clientsToRemove, c)
+
+			case status.BadRequestErr:
+				// Non-fatal bad client request
+				log.Printf("[bad request error] remote: %s", c.RemoteAddr())
+
+			case status.ServerErr:
+				// Some non-fatal server error occurred
+				log.Printf("[server error] remote: %s", c.RemoteAddr())
+
+			case status.FatalErr:
+				// Some fatal error occurred, close connection
+				log.Printf("[fatal error] remote: %s", c.RemoteAddr())
+
+				if res := c.Write([]byte("Fatal error. Closing connection.\n\n")); res.Status() != status.Success {
+					log.Println("write failed during close: ", res.Error())
+				}
+				clientsToRemove = append(clientsToRemove, c)
 			}
+		}
+
+		// Remove all the clients that were marked for removal
+		for _, c := range clientsToRemove {
+			clientRegistry.Remove(c)
 		}
 	}
 }
 
 // Handles a tcp connection and facilitates client interaction with the key-value store
-//
-// It returns:
-//   - 0 if there is nothing to read, and not close the connection
-//   - 1 benign exit, so just close the connection
-//   - -1 if there is an error
-func handleConnection(conn net.Conn, rbuf *bufio.Reader, kvs *store.KVStore) int {
+func handleConnection(c *client.Client, kvs *store.KVStore) status.StatusCode {
 
-	// set a 500 millisecond read deadline
-	conn.SetReadDeadline(time.Now().Add(time.Millisecond * 10))
+	res := c.Read('\n')
 
-	message, err := rbuf.ReadString('\n')
+	switch res.Status() {
+	// Keyboard interrupt (ctrl+c) was isssued, close connection with client
+	case status.Close:
+		return status.Close
 
-	if err != nil {
+	// Nothing to read, proceed normally and relinquish control of the thread
+	case status.Timeout:
+		return status.Timeout
 
-		var netErr net.Error
-
-		// Detect read timeouts or Ctrl+C keyboard interrupts and treat
-		// them as benign conditions
-		if err == io.EOF {
-			// Keyboard interrupt (ctrl+c) was isssued, close connection with client
-			return 1
-		} else if errors.As(err, &netErr) && netErr.Timeout() {
-			// Nothing to read, proceed normally and relinquish control of the thread
-			return 0
-		} else {
-			// Something truly went wrong, return an error code
-			log.Printf("[error] Reading client message failed: %s", err.Error())
-			return -1
-		}
+	// Something truly went wrong, return an error code
+	case status.ServerErr:
+		return status.ServerErr
 	}
 
-	log.Printf("Responding to: %s\n", conn.RemoteAddr().String())
-
-	// Clean up the message and check if exit is requested
-	trimmedMessage := strings.TrimSpace(message)
+	trimmedMessage := strings.TrimSpace(res.Message())
 
 	if strings.ToLower(trimmedMessage) == "exit" {
-		return 1
+		// Client explicitly sent the exit command
+		return status.Close
 	}
 
 	// Parse the message into a Command
-	cmd, err := command.Parse(message)
+	cmd, err := command.Parse(trimmedMessage)
 
 	if err != nil {
-		log.Printf("bad input error: %s", err.Error())
-		return -1
+		if res := c.Write(fmt.Appendf(nil, "Bad input error: %s\n\n> ", err.Error())); res.Status() != status.Success {
+			log.Println("Server write error: ", res.Error())
+			return status.FatalErr
+		}
+		return status.BadRequestErr
 	}
 
 	// Process the parsed command
-	result, err := kvs.ProcessCmd(&cmd)
-
-	var response string
+	kvResult, err := kvs.ProcessCmd(&cmd)
 
 	// Prepare the response string and write the result/error to the client
 	if err != nil {
-		response = fmt.Sprintf("%s\n\n> ", err.Error())
-	} else {
-		response = fmt.Sprintf("%s\n\n> ", result)
+		if res := c.Write(fmt.Appendf(nil, "%s\n\n> ", err.Error())); res.Status() != status.Success {
+			log.Println("Server write error: ", res.Error())
+			return status.FatalErr
+		}
+
+		return status.BadRequestErr
 	}
 
-	_, err = conn.Write([]byte(response))
+	response := fmt.Sprintf("%s\n\n> ", kvResult)
 
-	if err != nil {
-		log.Println("server write error:", err)
-		return -1
+	res = c.Write([]byte(response))
+
+	if res.Status() == status.ServerErr {
+		log.Println("Server write error:", res.Error())
+		return status.FatalErr
 	}
 
-	return 0
+	return status.Success
 }
